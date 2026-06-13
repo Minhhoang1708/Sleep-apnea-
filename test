@@ -1,0 +1,237 @@
+import cv2
+import numpy as np
+from scipy.fftpack import fft
+from scipy.signal import butter, filtfilt
+import sounddevice as sd
+import time
+import threading
+import platform
+import csv
+from datetime import datetime
+import os
+
+# Import MediaPipe Tasks API
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# --- GLOBAL VARIABLES ---
+current_audio_level = 0.0
+is_warning_playing = False 
+
+# --- IMPORT OS-SPECIFIC SOUND MODULE ---
+if platform.system() == "Windows":
+    import winsound
+
+# --- 1. WARNING SOUND FUNCTION (ORIGINAL BEEP) ---
+def play_warning_sound():
+    global is_warning_playing
+    is_warning_playing = True
+    
+    for _ in range(3):
+        if platform.system() == "Windows":
+            winsound.Beep(1500, 300) 
+        else:
+            os.system('play -nq -t alsa synth 0.3 sine 1500 >/dev/null 2>&1')
+        time.sleep(0.1)
+        
+    is_warning_playing = False
+
+# --- 2. MICROPHONE CALLBACK ---
+def audio_callback(indata, frames, time_info, status):
+    global current_audio_level
+    rms = np.sqrt(np.mean(indata**2))
+    current_audio_level = rms * 1000
+
+# --- 3. CSV LOG INITIALIZATION ---
+def init_log_file():
+    date_str = datetime.now().strftime("%Y%m%d")
+    filename = f"sleep_log_{date_str}.csv"
+    
+    if not os.path.exists(filename):
+        with open(filename, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Time", "Breathing Rate (BPM)", "Audio (RMS)", "Status"])
+            
+    return filename
+
+# --- 4. SIGNAL FILTERING ---
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=2):
+    nyq = 0.5 * fs 
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    y = filtfilt(b, a, data)
+    return y
+
+# --- 5. MAIN FUSION MONITOR ---
+def start_fusion_monitor():
+    cap = cv2.VideoCapture(0)
+    fps = 30
+    
+    # CỬA SỔ ĐO CHUẨN 30 GIÂY
+    window_size = fps * 30 
+    signal_buffer = []
+
+    # NGƯỠNG THUẬT TOÁN BÌNH THƯỜNG
+    VISUAL_STILL_THRESHOLD = 0.2   
+    AUDIO_SILENT_THRESHOLD = 0.5   
+    MOVEMENT_THRESHOLD = 2.0       
+    DANGEROUS_LOW_BPM = 8
+    DANGEROUS_HIGH_BPM = 25
+
+    # --- INIT MEDIAPIPE (VIDEO MODE FOR TRACKING) ---
+    try:
+        base_options = python.BaseOptions(model_asset_path='pose_landmarker_lite.task')
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO, 
+            output_segmentation_masks=False)
+        detector = vision.PoseLandmarker.create_from_options(options)
+    except Exception as e:
+        print("ERROR: Model file 'pose_landmarker_lite.task' not found!")
+        return
+
+    log_filename = init_log_file()
+    print("Starting Camera, Microphone, and AI Pose Tracking...")
+    
+    ret, frame1 = cap.read()
+    if not ret: return
+    
+    h, w = frame1.shape[:2]
+    ROI_W, ROI_H = int(w * 0.4), int(h * 0.3) 
+    current_roi_x, current_roi_y = int(w/2 - ROI_W/2), int(h*0.6) 
+    roi_prev = cv2.cvtColor(frame1[current_roi_y:current_roi_y+ROI_H, current_roi_x:current_roi_x+ROI_W], cv2.COLOR_BGR2GRAY)
+    
+    last_log_time = time.time()
+    last_bpm = 0.0  
+    frame_timestamp_ms = 0 
+
+    with sd.InputStream(callback=audio_callback, channels=1, samplerate=44100):
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+
+            # --- CHEST DETECTION (MEDIAPIPE) ---
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            
+            frame_timestamp_ms += int(1000 / fps)
+            detection_result = detector.detect_for_video(mp_image, frame_timestamp_ms)
+
+            if detection_result.pose_landmarks:
+                landmarks = detection_result.pose_landmarks[0]
+                l_shldr = landmarks[11]
+                r_shldr = landmarks[12]
+
+                chest_cx = int((l_shldr.x + r_shldr.x) / 2 * w)
+                chest_cy = int((l_shldr.y + r_shldr.y) / 2 * h) + int(h * 0.1)
+                
+                cv2.circle(frame, (chest_cx, chest_cy), 5, (0, 0, 255), -1)
+
+                if abs(chest_cx - (current_roi_x + ROI_W//2)) > 40 or abs(chest_cy - (current_roi_y + ROI_H//2)) > 40:
+                    current_roi_x = max(0, min(w - ROI_W, chest_cx - ROI_W//2))
+                    current_roi_y = max(0, min(h - ROI_H, chest_cy - ROI_H//2))
+                    
+                    roi_prev = cv2.cvtColor(frame[current_roi_y:current_roi_y+ROI_H, current_roi_x:current_roi_x+ROI_W], cv2.COLOR_BGR2GRAY)
+                    
+                    # BỘ ĐỆM BỊ XÓA -> RESET CHỈ SỐ NHỊP THỞ
+                    signal_buffer.clear() 
+                    last_bpm = 0.0 
+                    
+                    cv2.putText(frame, "RE-TRACKING...", (current_roi_x, current_roi_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                cv2.putText(frame, "AI LOST TRACKING!", (w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            cv2.rectangle(frame, (current_roi_x, current_roi_y), (current_roi_x+ROI_W, current_roi_y+ROI_H), (255, 0, 0), 2)
+            roi_next = cv2.cvtColor(frame[current_roi_y:current_roi_y+ROI_H, current_roi_x:current_roi_x+ROI_W], cv2.COLOR_BGR2GRAY)
+
+            flow = cv2.calcOpticalFlowFarneback(roi_prev, roi_next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            motion_magnitude = np.mean(mag)
+            
+            signal_buffer.append(motion_magnitude)
+            roi_prev = roi_next
+
+            if len(signal_buffer) > window_size:
+                signal_buffer.pop(0)
+
+            # --- WARNING LOGIC ---
+            if len(signal_buffer) > 0:
+                cv2.putText(frame, f"Movement: {motion_magnitude:.3f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame, f"Audio (RMS): {current_audio_level:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                if motion_magnitude > MOVEMENT_THRESHOLD:
+                    cv2.putText(frame, "Moving / Tossing...", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    
+                elif motion_magnitude < VISUAL_STILL_THRESHOLD and current_audio_level < AUDIO_SILENT_THRESHOLD:
+                    recent_frames = fps * 10
+                    if len(signal_buffer) >= recent_frames and np.mean(signal_buffer[-recent_frames:]) < VISUAL_STILL_THRESHOLD:
+                        cv2.putText(frame, "WARNING: APNEA DETECTED!", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        cv2.rectangle(frame, (current_roi_x, current_roi_y), (current_roi_x+ROI_W, current_roi_y+ROI_H), (0, 0, 255), 3) 
+                        
+                        global is_warning_playing
+                        if not is_warning_playing:
+                            threading.Thread(target=play_warning_sound, daemon=True).start()
+
+            # --- BREATHING RATE CALCULATION (FFT) ---
+            if len(signal_buffer) == window_size:
+                filtered_signal = butter_bandpass_filter(signal_buffer, 0.1, 0.5, fps, order=2)
+                
+                fft_vals = np.abs(fft(filtered_signal))
+                freqs = np.fft.fftfreq(len(fft_vals), 1.0/fps)
+
+                positive_freq_idx = np.where(freqs > 0)
+                fft_vals = fft_vals[positive_freq_idx]
+                freqs = freqs[positive_freq_idx]
+
+                valid_indices = np.where((freqs >= 0.1) & (freqs <= 0.5)) 
+                
+                if len(valid_indices[0]) > 0:
+                    valid_fft = fft_vals[valid_indices]
+                    valid_freqs = freqs[valid_indices]
+
+                    dominant_freq = valid_freqs[np.argmax(valid_fft)]
+                    raw_bpm = dominant_freq * 60
+
+                    # === FIX: BỘ LỌC GIẢM XÓC (EMA FILTER) LÀM MƯỢT SỐ BPM ===
+                    if last_bpm == 0.0:
+                        last_bpm = raw_bpm  # Khởi tạo giá trị đầu tiên
+                    else:
+                        last_bpm = 0.95 * last_bpm + 0.05 * raw_bpm  # Chống nhảy số loạn xạ
+
+                    log_status = "Normal"
+                    if last_bpm < DANGEROUS_LOW_BPM or last_bpm > DANGEROUS_HIGH_BPM:
+                        log_status = "DANGER"
+                        if not is_warning_playing:
+                            threading.Thread(target=play_warning_sound, daemon=True).start()
+                    elif last_bpm < 12 or last_bpm > 20:
+                        log_status = "Slight Anomaly"
+                    
+                    current_time_sec = time.time()
+                    if current_time_sec - last_log_time >= 1.0:
+                        last_log_time = current_time_sec
+                        current_time_str = datetime.now().strftime("%H:%M:%S")
+                        with open(log_filename, mode='a', newline='', encoding='utf-8') as file:
+                            writer = csv.writer(file)
+                            writer.writerow([current_time_str, round(last_bpm, 1), round(current_audio_level, 2), log_status])
+
+            # --- DISPLAY BPM ---
+            if last_bpm > 0:
+                display_color = (0, 255, 0)
+                if last_bpm < DANGEROUS_LOW_BPM or last_bpm > DANGEROUS_HIGH_BPM:
+                    display_color = (0, 0, 255)
+                elif last_bpm < 12 or last_bpm > 20:
+                    display_color = (0, 165, 255)
+                    
+                cv2.putText(frame, f"Breathing Rate: {last_bpm:.1f} bpm", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, display_color, 2)
+
+            cv2.imshow('Multi-Sensor Sleep Monitoring', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    start_fusion_monitor()
